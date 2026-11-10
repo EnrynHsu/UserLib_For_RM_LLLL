@@ -5,7 +5,6 @@
  * @brief   stm32F103CxT6 CAN通信 工具文件
  */
 
-#include "llll_can.h"
 #include "llll_can.hpp"
 
 using namespace llll::CAN;
@@ -18,7 +17,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         {
             HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &Driver::drivers[i]->rxBuffer.Header,
                                  Driver::drivers[i]->rxBuffer.Data);
-            Driver::drivers[i]->rx_call_back_0(Driver::drivers[i]->rxBuffer);
+            Driver::drivers[i]->OnReceive0(Driver::drivers[i]->rxBuffer);
         }
     }
 }
@@ -30,7 +29,7 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)
         {
             HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &Driver::drivers[i]->rxBuffer.Header,
                                  Driver::drivers[i]->rxBuffer.Data);
-            Driver::drivers[i]->rx_call_back_1(Driver::drivers[i]->rxBuffer);
+            Driver::drivers[i]->OnReceive1(Driver::drivers[i]->rxBuffer);
         }
     }
 }

@@ -137,6 +137,15 @@ class Driver
     RxCallback rx_call_back_0;
     RxCallback rx_call_back_1;
 
+    virtual void OnReceive0(const RxBuffer &rxBuffer)
+    {
+        rx_call_back_0(rxBuffer);
+    };
+    virtual void OnReceive1(const RxBuffer &rxBuffer)
+    {
+        rx_call_back_1(rxBuffer);
+    };
+
     friend void ::HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan);
     friend void ::HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan);
 };

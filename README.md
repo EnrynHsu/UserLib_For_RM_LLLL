@@ -1,7 +1,7 @@
 # LLLL STM32F1 C++ 外设库接口文档
 
-本文档依据工作区截至 2026-11-10 的源码整理，覆盖 UART、串口波形、GPIO 和 CAN
-四个模块。
+本文档依据工作区截至 2026-11-11 的源码整理，覆盖 UART、串口波形、GPIO、CAN
+和 C620 电机控制五个模块。
 
 ## 1. 库概览
 
@@ -18,6 +18,7 @@
 | SerialPlot | `llll::SerialPlot` | `llll_serial_plot.hpp` | 二进制波形上传、文本变量修改 |
 | GPIO | `llll::GPIO` | `llll_gpio.hpp/.cpp` | GPIO 引脚和引脚组控制 |
 | CAN | `llll::CAN` | `llll_can.hpp/.cpp` | bxCAN 发送、过滤和中断接收 |
+| C620 | `llll::MOTOR::C620` | `llll_motor.hpp/.cpp` | C620 控制帧聚合与反馈分发 |
 
 ## 2. 环境与集成
 
@@ -38,6 +39,7 @@
 llll_uart.cpp
 llll_gpio.cpp
 llll_can.cpp
+llll_motor.cpp
 ```
 
 `llll_serial_plot.cpp` 目前为空，`SerialPlot` 的实现全部位于模板头文件
@@ -73,8 +75,9 @@ HAL_CAN_RxFifo1MsgPendingCallback
 
 ### 2.5 对象生命周期
 
-UART 和 CAN 的 `Driver` 会把 `this` 注册到静态分发表中。对象必须具有足够长的
-生命周期，建议优先使用全局对象或在 `main()` 内使用静态局部对象：
+UART 和 CAN 的 `Driver` 会把 `this` 注册到静态分发表中。C620 的 `Controller`
+还会保存已注册 `Motor` 的地址。相关对象必须具有足够长的生命周期，建议优先
+使用全局对象或在 `main()` 内使用静态局部对象：
 
 ```cpp
 static llll::UART::Driver uart{&huart1, sizeof(rx_buffer), rx_buffer, OnUart};
@@ -84,6 +87,7 @@ static llll::UART::Driver uart{&huart1, sizeof(rx_buffer), rx_buffer, OnUart};
 移除对象，因此临时对象或局部对象结束后，中断回调可能访问失效地址。
 
 UART 和 CAN 各自最多保存 4 个驱动对象注册信息，当前实现没有容量溢出保护。
+C620 的 `Motor` 必须比引用它的 `Controller` 生命周期更长。
 
 ## 3. UART 接口
 
@@ -606,7 +610,10 @@ can.Add_Filter_32_Mask(
 
 1. 根据 `CAN_HandleTypeDef *` 找到对应 `Driver`。
 2. 从 FIFO 取出一个帧到该驱动内部的 `RxBuffer`。
-3. 调用对应 FIFO 的 `RxCallback`。
+3. 调用对应的虚函数 `OnReceive0()` 或 `OnReceive1()`。
+
+基类默认实现会调用构造时传入的 `RxCallback`。派生类可以覆盖
+`OnReceive0()`/`OnReceive1()` 直接处理数据，此时对应回调可以传 `nullptr`。
 
 回调中的 `RxBuffer` 引用指向驱动内部缓冲区，下一帧到达时会被覆盖。如果需要在
 回调返回后继续使用，应先把数据复制到自己的缓冲区。
@@ -648,10 +655,173 @@ void SetupCan()
 }
 ```
 
-示例工程当前使用 `CAN_MODE_SILENT_LOOPBACK` 静默回环模式。该模式适合板上自测，
-不会在物理 CAN 总线上正常收发；连接外部设备前应改为正常模式并重新计算波特率。
+本库不会修改 `hcan.Init.Mode`。静默回环模式适合板上自测，但不会在物理 CAN
+总线上正常收发；连接 C620 等外部设备前必须确认工程使用 `CAN_MODE_NORMAL`
+并正确配置波特率。
 
-## 7. 返回值与异步行为
+## 7. C620 电机控制接口
+
+头文件：
+
+```cpp
+#include "llll_motor.hpp"
+```
+
+该模块将职责分为两层：
+
+- `Controller` 负责 CAN 通信、控制帧聚合和反馈分发。
+- `Motor` 保存电机 ID、目标电流和反馈数据。
+
+一个 `Controller` 管理同一 CAN 控制帧组中的最多 8 个电机。电机 1～4 使用
+`0x200`，电机 5～8 使用 `0x1FF`；C620 的反馈 ID 为 `0x201～0x208`。
+
+### 7.1 `Motor`
+
+```cpp
+namespace llll::MOTOR::C620
+{
+
+class Motor
+{
+  public:
+    int16_t real_current{};
+    int16_t speed{};
+    int16_t angle{};
+    int16_t temperature{};
+    int16_t current{};
+
+    Motor(uint8_t id);
+    void Set(int16_t current);
+    void operator<<(int16_t current);
+};
+
+}
+```
+
+电机 ID 的有效范围是 1～8。`current` 是 C620 的原始转矩电流指令，范围为
+`-16384～16384`，对应约 `-20A～20A`。例如：
+
+```cpp
+llll::MOTOR::C620::Motor motor{1};
+motor.Set(1000);
+motor << -1000;
+```
+
+反馈字段说明：
+
+| 字段 | 含义 | 数据来源 |
+| --- | --- | --- |
+| `angle` | 机械角度 | 反馈数据 `Data[0..1]` |
+| `speed` | 转速，单位 rpm | 反馈数据 `Data[2..3]` |
+| `real_current` | 实际转矩电流原始值 | 反馈数据 `Data[4..5]` |
+| `temperature` | 温度 | 反馈数据 `Data[6]` |
+| `current` | 下一控制帧使用的目标电流 | 用户写入 |
+
+### 7.2 `Controller`
+
+```cpp
+class Controller : CAN::Driver
+{
+  public:
+    Controller(CAN_HandleTypeDef *hcan);
+    void Register(Motor &motor);
+    void operator<<(Motor &motor);
+    void Update();
+};
+```
+
+构造 `Controller` 时会：
+
+1. 注册并启动底层 CAN 驱动。
+2. 配置过滤器，接收 `0x200～0x20F` 范围内的标准数据帧并送入 FIFO0。
+3. 后续由中断回调把 `0x201～0x208` 的反馈分发到对应 `Motor`。
+
+注册电机：
+
+```cpp
+llll::MOTOR::C620::Controller controller{&hcan};
+llll::MOTOR::C620::Motor motor1{1};
+llll::MOTOR::C620::Motor motor2{2};
+
+controller << motor1;
+controller.Register(motor2);
+```
+
+`Update()` 组装并发送控制帧：
+
+- 电机 1～4 写入 `0x200` 的四个 `int16_t` 槽位。
+- 电机 5～8 写入 `0x1FF` 的四个 `int16_t` 槽位。
+- 未注册的槽位发送零电流。
+- 每帧字节序为高字节在前、低字节在后。
+
+应在控制循环中周期调用，例如每 1～10ms 调用一次：
+
+```cpp
+while (1)
+{
+    controller.Update();
+    HAL_Delay(10);
+}
+```
+
+### 7.3 与 SerialPlot 联调
+
+下面的例子同时上传电流、角度、转速、温度，并允许上位机修改目标电流：
+
+```cpp
+static llll::MOTOR::C620::Controller controller{&hcan};
+static llll::MOTOR::C620::Motor motor{1};
+
+controller << motor;
+
+static llll::SerialPlot::Driver<5, 64, int16_t> serial_plot{
+    &huart1,
+    0xAB,
+    {
+        {&motor.real_current, "real_current"},
+        {&motor.angle, "angle"},
+        {&motor.speed, "speed"},
+        {&motor.temperature, "temperature"},
+        {&motor.current, "current"}
+    }
+};
+
+while (1)
+{
+    controller.Update();
+    serial_plot.Update();
+    HAL_Delay(10);
+}
+```
+
+上位机发送以下文本即可把目标电流改为 1000：
+
+```text
+current=1000#
+```
+
+发送负数时使用：
+
+```text
+current=-1000#
+```
+
+上位机接收的二进制通道使用 STM32F1 的小端字节序；控制帧发送给 C620 时则由
+`Controller` 转换成高字节在前。
+
+### 7.4 CAN 硬件与引脚
+
+`Controller` 只负责 C620 协议，不负责 CAN 收发器引脚配置。STM32F1 的 CAN1
+默认引脚为 `PA11/PA12`；使用 `PB8/PB9` 时必须启用 AFIO 时钟并调用：
+
+```c
+__HAL_AFIO_REMAP_CAN1_2();
+```
+
+MCU 不能把 CAN 引脚直接连接到 C620 的 `CAN_H/CAN_L`，必须经过 CAN 收发器。
+还需要确认 CAN_H/CAN_L 没有接反、总线终端电阻和 C620 的波特率配置正确。
+
+## 8. 返回值与异步行为
 
 | 接口 | 成功返回 | 成功后的实际含义 |
 | --- | --- | --- |
@@ -663,24 +833,30 @@ void SetupCan()
 
 对 UART 和 CAN 的发送接口，上层不应把 `HAL_OK` 等同为“接收端已经收到”。
 
-## 8. 当前实现的已知限制
+## 9. 当前实现的已知限制
 
 以下内容是对当前源码行为的记录，不代表未来版本的接口承诺：
 
 - UART 和 CAN 的静态驱动表最多容纳 4 个对象，写入前没有越界检查。
 - UART 和 CAN 的析构函数不会注销静态分发项。
 - CAN 构造函数和过滤器配置函数没有向上返回 HAL 错误状态。
-- CAN 的两个接收回调必须非空，库中没有对空函数指针进行检查。
+- CAN 默认接收实现没有对空 `RxCallback` 进行检查；派生类覆盖回调时可以不传
+  普通回调，但未覆盖对应 FIFO 时应提供安全回调。
 - CAN 的 `Send_Data()` 不检查标准 ID 是否超过 `0x7FF`，也不检查 DLC 是否超过 8。
 - CAN 底层发送会读取完整 8 字节缓冲区，即使 DLC 小于 8。
 - `SerialPlot` 接收到长度恰好等于 `r` 的命令时会越界写入一个 `\0`。
 - `SerialPlot` 构造时没有限制通道列表长度，传入的元素数不能超过模板参数 `n`。
 - UART 默认接收路径没有检查构造时的回调是否为空。
-- `llll_uart.h` 中声明了 `LLLL_UART_Init()` 和 `LLLL_UART_Send_Data()`，但当前源码
-  没有对应实现；现阶段应使用 C++ 接口 `llll::UART::Driver`。
-- `llll_can.h` 目前不提供实际 C 接口，CAN 公共接口位于 `llll_can.hpp`。
+- `Controller::OnReceive0()` 当前未检查反馈 ID 范围和 `motors[id]` 是否为空；
+  应确保滤波器、电机注册和 ID 配置正确后再用于正式工程。
+- `Controller::Register()` 当前不检查 ID 是否越界、是否重复注册或是否已绑定
+  其他 Controller。
+- `Controller::Update()` 当前返回 `void`，不报告控制帧是否成功写入发送邮箱。
+- `Controller` 当前固定使用过滤器和 FIFO0；同一 `hcan` 不建议再创建独立
+  `CAN::Driver` 或其他 C620 Controller。
+- `Motor` 和 `Controller` 当前允许隐式复制；硬件对象应按唯一实例使用。
 
-## 9. 源文件索引
+## 10. 源文件索引
 
 - [llll_uart.hpp](llll_uart.hpp)
 - [llll_uart.cpp](llll_uart.cpp)
@@ -689,3 +865,5 @@ void SetupCan()
 - [llll_gpio.cpp](llll_gpio.cpp)
 - [llll_can.hpp](llll_can.hpp)
 - [llll_can.cpp](llll_can.cpp)
+- [llll_motor.hpp](llll_motor.hpp)
+- [llll_motor.cpp](llll_motor.cpp)
