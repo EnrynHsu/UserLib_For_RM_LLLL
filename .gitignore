@@ -1,0 +1,22 @@
+# Build outputs
+*.o
+*.obj
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.d
+*.dep
+*.crf
+*.lnp
+*.build_log.htm
+
+# IDE-specific files
+*.uvguix.*
+*.uvoptx
+
+# OS metadata
+.DS_Store
+Thumbs.db
